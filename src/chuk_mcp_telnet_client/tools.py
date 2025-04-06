@@ -3,9 +3,12 @@ import time
 from typing import List, Optional, Dict
 from pydantic import ValidationError
 
-from chuk_mcp_telnet_client.common.mcp_tool_decorator import mcp_tool
-from chuk_mcp_telnet_client.common.chuk_mcp_error import ChukMcpError
+# Use the runtime's tool decorator instead of a local one
+from chuk_mcp_runtime.common.mcp_tool_decorator import mcp_tool
+
+# Import our models using absolute imports
 from chuk_mcp_telnet_client.models import TelnetClientInput, TelnetClientOutput, CommandResponse
+from chuk_mcp_runtime.common.errors import ChukMcpRuntimeError
 
 # Telnet IAC / negotiation constants
 IAC  = bytes([255])  # Interpret As Command
@@ -66,7 +69,7 @@ def telnet_client_tool(
     if session:
         tn = session.get("telnet")
         if not tn:
-            raise ChukMcpError(f"Session {session_id} exists but telnet connection is invalid")
+            raise ChukMcpRuntimeError(f"Session {session_id} exists but telnet connection is invalid")
     else:
         tn = telnetlib.Telnet()
 
@@ -81,7 +84,7 @@ def telnet_client_tool(
         try:
             tn.open(validated_input.host, validated_input.port, timeout=10)
         except Exception as ex:
-            raise ChukMcpError(f"Failed to connect to Telnet server: {ex}")
+            raise ChukMcpRuntimeError(f"Failed to connect to Telnet server: {ex}")
 
         # Read initial banner by waiting a moment then reading all available data
         time.sleep(2)  # Give server time to send welcome message

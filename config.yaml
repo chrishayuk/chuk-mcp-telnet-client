@@ -1,0 +1,17 @@
+# CHUK MCP Telnet Client Configuration
+host:
+  name: "chuk-telnet-client"
+  log_level: "INFO"
+
+server:
+  type: "stdio"  # Options: stdio, websocket
+
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  reset_handlers: true
+  quiet_libraries: true
+
+tools:
+  registry_module: "chuk_mcp_runtime.common.mcp_tool_decorator"
+  registry_attr: "TOOLS_REGISTRY"

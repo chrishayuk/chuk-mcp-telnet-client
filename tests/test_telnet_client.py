@@ -4,7 +4,7 @@ import time
 import pytest
 import telnetlib
 
-from chuk_mcp_telnet_client.common.mcp_tool_decorator import mcp_tool
+from chuk_mcp_runtime.common.mcp_tool_decorator import mcp_tool
 from chuk_mcp_telnet_client.models import TelnetClientOutput, CommandResponse
 from chuk_mcp_telnet_client import (
     telnet_client_tool,
@@ -12,7 +12,7 @@ from chuk_mcp_telnet_client import (
     telnet_list_sessions,
     TELNET_SESSIONS,
 )
-from chuk_mcp_telnet_client.common.chuk_mcp_error import ChukMcpError
+from chuk_mcp_runtime.common.errors import ChukMcpRuntimeError
 
 # Define a fake Telnet class to simulate a Telnet server.
 class FakeTelnet:
@@ -124,7 +124,7 @@ def test_telnet_client_tool_invalid_input(fake_telnet):
 
 def test_telnet_client_tool_connection_failure(monkeypatch):
     """
-    Test that if telnetlib.Telnet.open fails, the tool raises a ChukMcpError.
+    Test that if telnetlib.Telnet.open fails, the tool raises a ChukMcpRuntimeError.
     """
     class FailingTelnet:
         def __init__(self):
@@ -139,7 +139,7 @@ def test_telnet_client_tool_connection_failure(monkeypatch):
     monkeypatch.setattr(telnetlib, "Telnet", lambda: FailingTelnet())
     TELNET_SESSIONS.clear()
 
-    with pytest.raises(ChukMcpError) as excinfo:
+    with pytest.raises(ChukMcpRuntimeError) as excinfo:
         telnet_client_tool("127.0.0.1", 8023, ["cmd"])
     assert "Failed to connect" in str(excinfo.value)
 
