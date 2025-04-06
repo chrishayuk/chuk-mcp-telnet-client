@@ -4,8 +4,7 @@ from typing import List, Optional, Dict
 from pydantic import ValidationError
 
 from chuk_mcp_telnet_client.common.mcp_tool_decorator import mcp_tool
-from mcp.shared.exceptions import McpError
-
+from chuk_mcp_telnet_client.common.chuk_mcp_error import ChukMcpError
 from chuk_mcp_telnet_client.models import TelnetClientInput, TelnetClientOutput, CommandResponse
 
 # Telnet IAC / negotiation constants
@@ -24,20 +23,30 @@ def telnet_client_tool(
     port: int, 
     commands: List[str], 
     session_id: Optional[str] = None,
-    close_session: bool = False
+    close_session: bool = False,
+    read_timeout: int = 5,
+    command_delay: float = 1.0,      # Delay after sending each command
+    response_wait: float = 1.5,      # Time to wait for complete response
+    strip_command_echo: bool = True  # Whether to try removing the command echo
 ) -> dict:
     """
-    Connect to the given Telnet server, do minimal Telnet option negotiation, 
-    send each command, and capture/return the responses in a dict.
-
-    :param host: Host/IP of the Telnet server.
-    :param port: Port number (e.g. 8023).
-    :param commands: List of commands to send to the server.
-    :param session_id: Optional session ID to maintain connection between calls.
-    :param close_session: If True, close the session after processing commands.
-    :return: A dict containing the server's responses and session info.
+    Universal Telnet client tool that works with various server types.
+    
+    Args:
+        host: Host or IP to connect to
+        port: Port number
+        commands: List of commands to send
+        session_id: Optional session ID for persistent connections
+        close_session: Whether to close the session after commands
+        read_timeout: Timeout in seconds when waiting for initial responses
+        command_delay: Delay after sending each command
+        response_wait: Additional time to wait for complete response
+        strip_command_echo: Try to remove command echo from responses
+    
+    Returns:
+        Dictionary with server responses and session information
     """
-    # 1) Validate input using TelnetClientInput
+    # Validate input
     try:
         validated_input = TelnetClientInput(
             host=host, 
@@ -47,25 +56,20 @@ def telnet_client_tool(
     except ValidationError as e:
         raise ValueError(f"Invalid input for telnet_client_tool: {e}")
 
-    # Generate a session ID if none provided
     if not session_id:
         session_id = f"telnet_{host}_{port}_{int(time.time())}"
     
-    # Check if we have an existing session
     session = TELNET_SESSIONS.get(session_id)
     tn = None
-    initial_data = ""
-    
+    initial_data = b""
+
     if session:
-        # Reuse existing session
         tn = session.get("telnet")
         if not tn:
-            raise McpError(f"Session {session_id} exists but telnet connection is invalid")
+            raise ChukMcpError(f"Session {session_id} exists but telnet connection is invalid")
     else:
-        # Create new session
         tn = telnetlib.Telnet()
-        
-        # Minimal negotiation callback: always refuse
+
         def negotiation_callback(sock, cmd, opt):
             if cmd == DO:
                 sock.sendall(IAC + WONT + opt)
@@ -74,16 +78,19 @@ def telnet_client_tool(
 
         tn.set_option_negotiation_callback(negotiation_callback)
 
-        # Open the connection
         try:
             tn.open(validated_input.host, validated_input.port, timeout=10)
         except Exception as ex:
-            raise McpError(f"Failed to connect to Telnet server: {ex}")
+            raise ChukMcpError(f"Failed to connect to Telnet server: {ex}")
 
-        # Read initial banner
-        initial_data = tn.read_until(b"> ", timeout=2).decode("utf-8", errors="ignore")
+        # Read initial banner by waiting a moment then reading all available data
+        time.sleep(2)  # Give server time to send welcome message
+        initial_data = tn.read_very_eager()
         
-        # Store the session
+        # If nothing received, try to read some data
+        if not initial_data:
+            initial_data = tn.read_some()
+        
         TELNET_SESSIONS[session_id] = {
             "telnet": tn,
             "host": validated_input.host,
@@ -91,26 +98,78 @@ def telnet_client_tool(
             "created_at": time.time()
         }
 
-    # Send commands and collect responses
+    initial_banner = initial_data.decode("utf-8", errors="ignore")
     responses = []
+    
     for cmd in validated_input.commands:
-        tn.write(cmd.encode("utf-8") + b"\n")
-        data = tn.read_until(b"> ", timeout=5)
+        cmd_bytes = cmd.encode("utf-8") + b"\r\n"  # Use both CR and LF for maximum compatibility
+        tn.write(cmd_bytes)
+        
+        # Give the server time to process the command
+        time.sleep(command_delay)
+        
+        # Read response using a combination of techniques to ensure we get complete data
+        data = b""
+        
+        # First try to read any immediately available data
+        initial_chunk = tn.read_very_eager()
+        if initial_chunk:
+            data += initial_chunk
+        
+        # Wait a bit more for additional data to arrive
+        time.sleep(response_wait)
+        
+        # Read any remaining data
+        more_data = tn.read_very_eager()
+        if more_data:
+            data += more_data
+            
+        # If we still don't have data, try one more approach
+        if not data:
+            data = tn.read_some()
+        
+        # Decode the response
+        response_text = data.decode("utf-8", errors="ignore")
+        
+        # Try to remove command echo if requested
+        if strip_command_echo:
+            # Remove both CR/LF and just LF variants of the command
+            cmd_variants = [
+                cmd,                 # Raw command
+                cmd + "\r\n",        # Command with CRLF
+                cmd + "\n",          # Command with LF
+                "\r\n" + cmd,        # CRLF then command
+                "\n" + cmd           # LF then command
+            ]
+            
+            for variant in cmd_variants:
+                if response_text.startswith(variant):
+                    response_text = response_text[len(variant):]
+                    break
+                    
+            # Also check for the command in the middle of the response
+            # (some servers echo after initial protocol output)
+            for variant in cmd_variants:
+                if variant in response_text:
+                    parts = response_text.split(variant, 1)
+                    if len(parts) > 1:
+                        # Only remove first occurrence
+                        response_text = parts[0] + parts[1]
+                        break
+        
         responses.append(CommandResponse(
             command=cmd,
-            response=data.decode("utf-8", errors="ignore")
+            response=response_text
         ))
 
-    # Close the session if requested
     if close_session and session_id in TELNET_SESSIONS:
         tn.close()
         del TELNET_SESSIONS[session_id]
 
-    # Construct output
     output_model = TelnetClientOutput(
         host=validated_input.host,
         port=validated_input.port,
-        initial_banner=initial_data,
+        initial_banner=initial_banner,
         responses=responses,
         session_id=session_id,
         session_active=session_id in TELNET_SESSIONS
