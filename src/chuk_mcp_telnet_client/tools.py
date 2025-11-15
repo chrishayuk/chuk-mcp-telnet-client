@@ -1,5 +1,6 @@
 import telnetlib
 import time
+import asyncio
 from typing import List, Optional, Dict
 from pydantic import ValidationError
 
@@ -21,7 +22,7 @@ WILL = bytes([251])
 TELNET_SESSIONS: Dict[str, dict] = {}
 
 @mcp_tool(name="telnet_client", description="Connect to a Telnet server, run commands, and return output.")
-def telnet_client_tool(
+async def telnet_client_tool(
     host: str, 
     port: int, 
     commands: List[str], 
@@ -87,7 +88,7 @@ def telnet_client_tool(
             raise ChukMcpRuntimeError(f"Failed to connect to Telnet server: {ex}")
 
         # Read initial banner by waiting a moment then reading all available data
-        time.sleep(2)  # Give server time to send welcome message
+        await asyncio.sleep(2)  # Give server time to send welcome message
         initial_data = tn.read_very_eager()
         
         # If nothing received, try to read some data
@@ -109,18 +110,18 @@ def telnet_client_tool(
         tn.write(cmd_bytes)
         
         # Give the server time to process the command
-        time.sleep(command_delay)
-        
+        await asyncio.sleep(command_delay)
+
         # Read response using a combination of techniques to ensure we get complete data
         data = b""
-        
+
         # First try to read any immediately available data
         initial_chunk = tn.read_very_eager()
         if initial_chunk:
             data += initial_chunk
-        
+
         # Wait a bit more for additional data to arrive
-        time.sleep(response_wait)
+        await asyncio.sleep(response_wait)
         
         # Read any remaining data
         more_data = tn.read_very_eager()
@@ -182,7 +183,7 @@ def telnet_client_tool(
 
 # Add a tool for closing specific sessions
 @mcp_tool(name="telnet_close_session", description="Close a specific Telnet session.")
-def telnet_close_session(session_id: str) -> dict:
+async def telnet_close_session(session_id: str) -> dict:
     """
     Close a specific Telnet session by ID.
 
@@ -201,7 +202,7 @@ def telnet_close_session(session_id: str) -> dict:
 
 # Add a tool for listing active sessions
 @mcp_tool(name="telnet_list_sessions", description="List all active Telnet sessions.")
-def telnet_list_sessions() -> dict:
+async def telnet_list_sessions() -> dict:
     """
     List all active Telnet sessions.
 
