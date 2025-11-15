@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "chuk-mcp-telnet-client"
-version = "0.1.4"
+version = "0.2"
 description = "MCP Telnet Client"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -17,6 +17,7 @@ dependencies = [
 ]
 
 [project.scripts]
+chuk-mcp-telnet-client = "chuk_mcp_telnet_client.main:main"
 mcp-telnet-client = "chuk_mcp_telnet_client.main:main"
 
 [dependency-groups]
