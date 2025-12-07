@@ -10,5 +10,8 @@ wheels/
 .venv
 
 # ignore
-.pytest_cache
-s
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.claude/
+xwhtmlcov/

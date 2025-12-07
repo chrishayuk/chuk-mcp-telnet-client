@@ -1,289 +1,436 @@
-import telnetlib
-import time
+"""
+Telnet client tools for MCP server.
+
+Provides async telnet connectivity with session management.
+"""
+
 import asyncio
-import pickle
-import base64
-from typing import List, Optional, Dict
-from pydantic import ValidationError
+import logging
+import telnetlib  # nosec B401 - telnet is the purpose of this MCP server
+import time
+from dataclasses import dataclass
+from enum import Enum
+from typing import Optional
 
-# Use the runtime's tool decorator instead of a local one
-from chuk_mcp_runtime.common.mcp_tool_decorator import mcp_tool
+from chuk_mcp_server import tool
+from pydantic import BaseModel, ValidationError
 
-# Import our models using absolute imports
-from chuk_mcp_telnet_client.models import TelnetClientInput, TelnetClientOutput, CommandResponse
-from chuk_mcp_runtime.common.errors import ChukMcpRuntimeError
-
-# Import runtime session management for persistence across process invocations
-from chuk_mcp_runtime.session import (
-    MCPSessionManager,
-    get_session_or_none,
+from chuk_mcp_telnet_client.models import (
+    CommandResponse,
+    TelnetClientInput,
+    TelnetClientOutput,
 )
 
-# Create a singleton session manager instance
-_session_manager = None
+logger = logging.getLogger(__name__)
 
-def _get_session_manager() -> MCPSessionManager:
-    """Get or create the session manager singleton."""
-    global _session_manager
-    if _session_manager is None:
-        _session_manager = MCPSessionManager(sandbox_id="telnet-client")
-    return _session_manager
 
-# Telnet IAC / negotiation constants
-IAC  = bytes([255])  # Interpret As Command
-DONT = bytes([254])
-DO   = bytes([253])
-WONT = bytes([252])
-WILL = bytes([251])
+# ============================================================================
+# Constants
+# ============================================================================
 
-# Session storage helper functions using runtime's persistent session manager
-async def _store_telnet_session(session_id: str, tn: telnetlib.Telnet, host: str, port: int):
-    """Store telnet connection info in persistent session storage."""
-    # We can't pickle the telnet connection itself, so we just store metadata
-    # The actual connection will be recreated if needed
-    mgr = _get_session_manager()
-    session_data = {
-        "host": host,
-        "port": port,
-        "created_at": time.time(),
-        "has_connection": True,
-    }
+
+class TelnetCommand(bytes, Enum):
+    """Telnet protocol command constants."""
+
+    IAC = bytes([255])  # Interpret As Command
+    DONT = bytes([254])  # Don't perform option
+    DO = bytes([253])  # Do perform option
+    WONT = bytes([252])  # Won't perform option
+    WILL = bytes([251])  # Will perform option
+
+
+class TelnetDefaults:
+    """Default values for telnet operations."""
+
+    CONNECTION_TIMEOUT: int = 10
+    INITIAL_BANNER_WAIT: float = 2.0
+    COMMAND_DELAY: float = 1.0
+    RESPONSE_WAIT: float = 1.5
+    READ_TIMEOUT: int = 5
+
+
+# ============================================================================
+# Session Models
+# ============================================================================
+
+
+@dataclass
+class TelnetSession:
+    """Represents an active telnet connection session."""
+
+    telnet: telnetlib.Telnet
+    host: str
+    port: int
+    created_at: float
+    session_id: str
+
+
+class SessionInfo(BaseModel):
+    """Information about a telnet session."""
+
+    session_id: str
+    host: str
+    port: int
+    created_at: float
+    age_seconds: float
+
+
+class SessionListResponse(BaseModel):
+    """Response for listing active sessions."""
+
+    active_sessions: int
+    sessions: dict[str, SessionInfo]
+    note: str = (
+        "Active connections shown. Sessions persist when using HTTP/SSE transport."
+    )
+
+
+class SessionCloseResponse(BaseModel):
+    """Response for closing a session."""
+
+    success: bool
+    message: str
+
+
+# ============================================================================
+# Session Storage
+# ============================================================================
+
+
+class SessionStore:
+    """In-memory storage for active telnet connections."""
+
+    def __init__(self):
+        self._sessions: dict[str, TelnetSession] = {}
+
+    async def store(self, session: TelnetSession) -> None:
+        """Store a telnet session."""
+        self._sessions[session.session_id] = session
+
+    async def get(self, session_id: str) -> Optional[TelnetSession]:
+        """Retrieve a telnet session."""
+        return self._sessions.get(session_id)
+
+    async def delete(self, session_id: str) -> None:
+        """Delete a telnet session and close connection."""
+        session = self._sessions.get(session_id)
+        if session:
+            try:
+                session.telnet.close()
+            except Exception as e:
+                logger.warning(f"Error closing telnet connection: {e}")
+            del self._sessions[session_id]
+
+    async def list_all(self) -> list[TelnetSession]:
+        """List all active sessions."""
+        return list(self._sessions.values())
+
+
+# Global session store instance
+_session_store = SessionStore()
+
+
+# ============================================================================
+# Telnet Operations
+# ============================================================================
+
+
+def _create_negotiation_callback():
+    """Create a telnet option negotiation callback."""
+
+    def callback(sock, cmd, opt):
+        """Handle telnet option negotiation."""
+        if cmd == TelnetCommand.DO.value:
+            sock.sendall(TelnetCommand.IAC.value + TelnetCommand.WONT.value + opt)
+        elif cmd == TelnetCommand.WILL.value:
+            sock.sendall(TelnetCommand.IAC.value + TelnetCommand.DONT.value + opt)
+
+    return callback
+
+
+async def _connect_telnet(host: str, port: int) -> tuple[telnetlib.Telnet, str]:
+    """
+    Establish a new telnet connection.
+
+    Args:
+        host: Hostname or IP address
+        port: Port number
+
+    Returns:
+        Tuple of (telnet connection, initial banner)
+
+    Raises:
+        RuntimeError: If connection fails
+    """
+    tn = telnetlib.Telnet()  # nosec B312 - telnet is the purpose of this MCP server
+    tn.set_option_negotiation_callback(_create_negotiation_callback())
+
     try:
-        await mgr.update_session(session_id, custom_metadata=session_data)
-    except Exception:
-        # Session might not exist, try to create it
-        try:
-            await mgr.create_session(
-                session_id=session_id,
-                user_id="telnet-user",
-                custom_metadata=session_data
-            )
-        except Exception:
-            pass  # Best effort
+        tn.open(host, port, timeout=TelnetDefaults.CONNECTION_TIMEOUT)
+    except Exception as ex:
+        raise RuntimeError(f"Failed to connect to Telnet server at {host}:{port}: {ex}")
 
-async def _get_telnet_session(session_id: str) -> Optional[dict]:
-    """Retrieve telnet session info from persistent storage."""
-    try:
-        session = await get_session_or_none(session_id)
-        if session and hasattr(session, 'custom_metadata'):
-            metadata = session.custom_metadata
-            if isinstance(metadata, dict) and metadata.get("has_connection"):
-                return metadata
-    except Exception:
-        pass
-    return None
+    # Read initial banner
+    await asyncio.sleep(TelnetDefaults.INITIAL_BANNER_WAIT)
+    initial_data = tn.read_very_eager()
 
-async def _delete_telnet_session(session_id: str):
-    """Remove telnet session from persistent storage."""
-    mgr = _get_session_manager()
-    try:
-        await mgr.update_session(session_id, custom_metadata={"has_connection": False})
-    except Exception:
-        pass
+    # Try to read some data if nothing received
+    if not initial_data:
+        initial_data = tn.read_some()
 
-@mcp_tool(name="telnet_client", description="Connect to a Telnet server, run commands, and return output.")
+    initial_banner = initial_data.decode("utf-8", errors="ignore")
+    return tn, initial_banner
+
+
+def _strip_command_echo(response: str, command: str) -> str:
+    """
+    Remove command echo from telnet response.
+
+    Args:
+        response: Raw telnet response
+        command: Command that was sent
+
+    Returns:
+        Response with command echo removed
+    """
+    # Try different variants of command echo
+    variants = [
+        command,
+        command + "\r\n",
+        command + "\n",
+        "\r\n" + command,
+        "\n" + command,
+    ]
+
+    for variant in variants:
+        if response.startswith(variant):
+            return response[len(variant) :]
+
+    # Check for command in the middle of response
+    for variant in variants:
+        if variant in response:
+            parts = response.split(variant, 1)
+            if len(parts) > 1:
+                return parts[0] + parts[1]
+
+    return response
+
+
+async def _execute_command(
+    tn: telnetlib.Telnet,
+    command: str,
+    command_delay: float,
+    response_wait: float,
+    strip_echo: bool,
+) -> CommandResponse:
+    """
+    Execute a single command on the telnet connection.
+
+    Args:
+        tn: Active telnet connection
+        command: Command to execute
+        command_delay: Delay after sending command
+        response_wait: Time to wait for complete response
+        strip_echo: Whether to strip command echo
+
+    Returns:
+        CommandResponse with command and its response
+    """
+    # Send command with CRLF
+    cmd_bytes = command.encode("utf-8") + b"\r\n"
+    tn.write(cmd_bytes)
+
+    # Give server time to process
+    await asyncio.sleep(command_delay)
+
+    # Read response in chunks
+    data = b""
+
+    # Read immediately available data
+    initial_chunk = tn.read_very_eager()
+    if initial_chunk:
+        data += initial_chunk
+
+    # Wait for additional data
+    await asyncio.sleep(response_wait)
+
+    # Read remaining data
+    more_data = tn.read_very_eager()
+    if more_data:
+        data += more_data
+
+    # If no data, try one more approach
+    if not data:
+        data = tn.read_some()
+
+    # Decode response
+    response_text = data.decode("utf-8", errors="ignore")
+
+    # Strip command echo if requested
+    if strip_echo:
+        response_text = _strip_command_echo(response_text, command)
+
+    return CommandResponse(command=command, response=response_text)
+
+
+# ============================================================================
+# MCP Tools
+# ============================================================================
+
+
+@tool(
+    name="telnet_client",
+    description="Connect to a Telnet server, run commands, and return output.",
+)
 async def telnet_client_tool(
     host: str,
     port: int,
-    commands: List[str],
-    session_id: Optional[str] = None,
+    commands: list[str],
+    telnet_session_id: Optional[str] = None,
     close_session: bool = False,
-    read_timeout: int = 5,
-    command_delay: float = 1.0,      # Delay after sending each command
-    response_wait: float = 1.5,      # Time to wait for complete response
-    strip_command_echo: bool = True  # Whether to try removing the command echo
-) -> dict:
+    read_timeout: int = TelnetDefaults.READ_TIMEOUT,
+    command_delay: float = TelnetDefaults.COMMAND_DELAY,
+    response_wait: float = TelnetDefaults.RESPONSE_WAIT,
+    strip_command_echo: bool = True,
+) -> TelnetClientOutput:
     """
     Universal Telnet client tool that works with various server types.
 
-    NOTE: Session reuse across multiple tool calls is NOT supported when running
-    via stdio transport because each call is a new process. The telnet connection
-    cannot be persisted. This tool will create a fresh connection for each call.
+    Supports session persistence when running via HTTP/SSE transport, allowing
+    you to maintain an open telnet connection across multiple tool calls.
 
     Args:
         host: Host or IP to connect to
         port: Port number
         commands: List of commands to send
-        session_id: Session ID (informational only - connections cannot persist across calls)
-        close_session: Whether to close the session after commands (always true for stdio)
+        telnet_session_id: Telnet session ID for reusing existing connections (HTTP/SSE only)
+        close_session: Whether to close the telnet session after commands
         read_timeout: Timeout in seconds when waiting for initial responses
         command_delay: Delay after sending each command
         response_wait: Additional time to wait for complete response
         strip_command_echo: Try to remove command echo from responses
 
     Returns:
-        Dictionary with server responses and session information
+        TelnetClientOutput with server responses and session information
+
+    Raises:
+        ValueError: If input validation fails
+        RuntimeError: If connection fails
     """
     # Validate input
     try:
-        validated_input = TelnetClientInput(
-            host=host,
-            port=port,
-            commands=commands
-        )
+        validated_input = TelnetClientInput(host=host, port=port, commands=commands)
     except ValidationError as e:
         raise ValueError(f"Invalid input for telnet_client_tool: {e}")
 
-    if not session_id:
-        session_id = f"telnet_{host}_{port}_{int(time.time())}"
+    # Generate session ID if not provided
+    if not telnet_session_id:
+        telnet_session_id = f"telnet_{host}_{port}_{int(time.time())}"
 
-    # Check if session info exists in persistent storage
-    # (Note: We can't reuse the actual connection, but we can track session history)
-    session_data = await _get_telnet_session(session_id)
+    # Try to retrieve existing session
+    existing_session = await _session_store.get(telnet_session_id)
 
-    # Always create a fresh connection (connections can't persist across process invocations)
-    tn = telnetlib.Telnet()
-    initial_data = b""
+    if existing_session:
+        # Reuse existing connection
+        tn = existing_session.telnet
+        initial_banner = ""  # No banner for existing sessions
+    else:
+        # Create new connection
+        tn, initial_banner = await _connect_telnet(
+            validated_input.host, validated_input.port
+        )
 
-    def negotiation_callback(sock, cmd, opt):
-        if cmd == DO:
-            sock.sendall(IAC + WONT + opt)
-        elif cmd == WILL:
-            sock.sendall(IAC + DONT + opt)
+        # Store the new session
+        new_session = TelnetSession(
+            telnet=tn,
+            host=validated_input.host,
+            port=validated_input.port,
+            created_at=time.time(),
+            session_id=telnet_session_id,
+        )
+        await _session_store.store(new_session)
 
-    tn.set_option_negotiation_callback(negotiation_callback)
-
-    try:
-        tn.open(validated_input.host, validated_input.port, timeout=10)
-    except Exception as ex:
-        raise ChukMcpRuntimeError(f"Failed to connect to Telnet server: {ex}")
-
-    # Read initial banner by waiting a moment then reading all available data
-    await asyncio.sleep(2)  # Give server time to send welcome message
-    initial_data = tn.read_very_eager()
-
-    # If nothing received, try to read some data
-    if not initial_data:
-        initial_data = tn.read_some()
-
-    # Store session metadata (not the connection itself)
-    await _store_telnet_session(session_id, tn, validated_input.host, validated_input.port)
-
-    initial_banner = initial_data.decode("utf-8", errors="ignore")
-    responses = []
-    
+    # Execute commands
+    responses: list[CommandResponse] = []
     for cmd in validated_input.commands:
-        cmd_bytes = cmd.encode("utf-8") + b"\r\n"  # Use both CR and LF for maximum compatibility
-        tn.write(cmd_bytes)
-        
-        # Give the server time to process the command
-        await asyncio.sleep(command_delay)
-
-        # Read response using a combination of techniques to ensure we get complete data
-        data = b""
-
-        # First try to read any immediately available data
-        initial_chunk = tn.read_very_eager()
-        if initial_chunk:
-            data += initial_chunk
-
-        # Wait a bit more for additional data to arrive
-        await asyncio.sleep(response_wait)
-        
-        # Read any remaining data
-        more_data = tn.read_very_eager()
-        if more_data:
-            data += more_data
-            
-        # If we still don't have data, try one more approach
-        if not data:
-            data = tn.read_some()
-        
-        # Decode the response
-        response_text = data.decode("utf-8", errors="ignore")
-        
-        # Try to remove command echo if requested
-        if strip_command_echo:
-            # Remove both CR/LF and just LF variants of the command
-            cmd_variants = [
-                cmd,                 # Raw command
-                cmd + "\r\n",        # Command with CRLF
-                cmd + "\n",          # Command with LF
-                "\r\n" + cmd,        # CRLF then command
-                "\n" + cmd           # LF then command
-            ]
-            
-            for variant in cmd_variants:
-                if response_text.startswith(variant):
-                    response_text = response_text[len(variant):]
-                    break
-                    
-            # Also check for the command in the middle of the response
-            # (some servers echo after initial protocol output)
-            for variant in cmd_variants:
-                if variant in response_text:
-                    parts = response_text.split(variant, 1)
-                    if len(parts) > 1:
-                        # Only remove first occurrence
-                        response_text = parts[0] + parts[1]
-                        break
-        
-        responses.append(CommandResponse(
+        response = await _execute_command(
+            tn=tn,
             command=cmd,
-            response=response_text
-        ))
+            command_delay=command_delay,
+            response_wait=response_wait,
+            strip_echo=strip_command_echo,
+        )
+        responses.append(response)
 
-    # Always close the connection (stdio transport cannot maintain persistent connections)
-    try:
-        tn.close()
-    except:
-        pass  # Best effort close
-
-    # Mark session as closed if requested
+    # Close connection if requested
     if close_session:
-        await _delete_telnet_session(session_id)
+        await _session_store.delete(telnet_session_id)
 
-    output_model = TelnetClientOutput(
+    # Check if session is still active
+    session_active = await _session_store.get(telnet_session_id) is not None
+
+    # Debug logging
+    logger.info(
+        f"Session check: telnet_session_id={telnet_session_id}, active={session_active}"
+    )
+
+    return TelnetClientOutput(
         host=validated_input.host,
         port=validated_input.port,
         initial_banner=initial_banner,
         responses=responses,
-        session_id=session_id,
-        session_active=False  # Connection always closed after each call in stdio mode
+        session_id=telnet_session_id,
+        session_active=session_active,
     )
 
-    return output_model.model_dump()
 
-# Add a tool for closing specific sessions
-@mcp_tool(name="telnet_close_session", description="Close a specific Telnet session (marks session metadata as closed).")
-async def telnet_close_session(session_id: str) -> dict:
+@tool(name="telnet_close_session", description="Close a specific Telnet session.")
+async def telnet_close_session(session_id: str) -> SessionCloseResponse:
     """
-    Mark a specific Telnet session as closed in persistent storage.
+    Close a specific Telnet session.
 
     NOTE: In stdio transport mode, actual telnet connections are always closed
     after each tool call. This just removes the session metadata.
 
-    :param session_id: The session ID to close.
-    :return: Status of the operation.
+    Args:
+        session_id: The session ID to close
+
+    Returns:
+        SessionCloseResponse with operation status
     """
-    await _delete_telnet_session(session_id)
-    return {"success": True, "message": f"Session {session_id} marked as closed"}
+    await _session_store.delete(session_id)
+    return SessionCloseResponse(
+        success=True, message=f"Session {session_id} closed successfully"
+    )
 
-# Add a tool for listing active sessions
-@mcp_tool(name="telnet_list_sessions", description="List all Telnet sessions (metadata only - actual connections don't persist).")
-async def telnet_list_sessions() -> dict:
+
+@tool(
+    name="telnet_list_sessions",
+    description="List all active Telnet sessions with connection details.",
+)
+async def telnet_list_sessions() -> SessionListResponse:
     """
-    List Telnet session metadata from persistent storage.
+    List all active Telnet sessions.
 
-    NOTE: In stdio transport mode, actual telnet connections cannot persist
-    across tool calls. This lists session metadata only.
+    In HTTP mode, this shows truly active connections.
+    In stdio mode, this will always be empty.
 
-    :return: Dict with session information.
+    Returns:
+        SessionListResponse with all active sessions
     """
-    # Get all sessions from the session manager
-    mgr = _get_session_manager()
+    sessions = await _session_store.list_all()
+    current_time = time.time()
 
-    # Try to list all sessions (this may not be supported by all implementations)
-    sessions = {}
-    try:
-        # For now, we'll just return an empty list since we don't have a way to enumerate
-        # all sessions without the session IDs. In practice, the LLM should track session IDs.
-        pass
-    except Exception:
-        pass
+    session_info_dict: dict[str, SessionInfo] = {}
+    for session in sessions:
+        session_info_dict[session.session_id] = SessionInfo(
+            session_id=session.session_id,
+            host=session.host,
+            port=session.port,
+            created_at=session.created_at,
+            age_seconds=current_time - session.created_at,
+        )
 
-    return {
-        "active_sessions": len(sessions),
-        "sessions": sessions,
-        "note": "Sessions listed are metadata only. Actual telnet connections cannot persist in stdio mode. Session tracking requires the LLM to remember session IDs across calls."
-    }
+    return SessionListResponse(
+        active_sessions=len(session_info_dict), sessions=session_info_dict
+    )

@@ -72,10 +72,41 @@ pip install .[dev]  # Installs package with development dependencies
 
 ## Running the Server
 
+### Transport Modes
+
+The server supports two transport modes:
+
+1. **stdio (default)** - For MCP clients and uvx
+   - Works with Claude Desktop and other MCP clients
+   - Perfect for one-shot commands via uvx
+   - No session persistence across invocations
+   - Recommended for most use cases
+
+2. **HTTP** - For persistent sessions
+   - Allows session reuse across multiple requests
+   - Telnet connections remain open between calls
+   - Useful for interactive scenarios
+
 ### Command-Line Interface
 
 ```bash
-chuk-mcp-telnet-client
+# stdio mode (default) - works with uvx and MCP clients
+mcp-telnet-client
+
+# Or explicitly specify stdio
+mcp-telnet-client stdio
+
+# HTTP mode for persistent sessions
+mcp-telnet-client http
+```
+
+### Using with uvx (Recommended)
+
+```bash
+# One-shot usage via uvx (stdio mode by default)
+uvx chuk-mcp-telnet-client
+
+# The server will communicate via stdio, perfect for MCP clients
 ```
 
 ### Programmatic Usage
@@ -84,13 +115,8 @@ chuk-mcp-telnet-client
 from chuk_mcp_telnet_client.main import main
 
 if __name__ == "__main__":
-    main()
+    main()  # Runs in stdio mode by default
 ```
-
-## Environment Variables
-
-- `NO_BOOTSTRAP`: Set to disable component bootstrapping
-- Other configuration options can be set in the configuration files
 
 ## Available Tools
 
@@ -98,12 +124,19 @@ if __name__ == "__main__":
 
 Establishes a connection to a Telnet server and executes commands.
 
+**Session Behavior**:
+- **stdio mode**: Sessions are not persisted between invocations. Each call creates a new connection, executes commands, and closes. The `session_id` parameter has no effect.
+- **HTTP mode**: Sessions persist in memory. Use `session_id` to reuse connections across multiple requests for interactive sessions.
+
 **Input**:
 - `host`: Host/IP of the Telnet server
 - `port`: Port number (e.g., 8023)
 - `commands`: List of commands to send to the server
-- `session_id` (optional): ID to maintain connection between calls
+- `telnet_session_id` (optional): ID to maintain connection between calls (HTTP mode only)
 - `close_session` (optional): If True, close the session after processing commands
+- `command_delay`: Delay in seconds after sending each command (default: 1.0)
+- `response_wait`: Time to wait for response in seconds (default: 1.5)
+- `strip_command_echo`: Remove command echo from responses (default: True)
 
 **Example**:
 ```python

@@ -4,13 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "chuk-mcp-telnet-client"
-version = "0.2.2"
+version = "0.3"
 description = "MCP Telnet Client"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "chuk-mcp-runtime>=0.10.6",
-    "mcp>=1.23.1",
+    "chuk-mcp-server>=0.15.1",
     "pydantic>=2.11.2",
     "pyyaml>=6.0.2",
     "telnetlib3>=2.0.4",
@@ -23,6 +22,12 @@ mcp-telnet-client = "chuk_mcp_telnet_client.main:main"
 [dependency-groups]
 dev = [
     "pytest>=8.3.5",
+    "pytest-asyncio>=0.24.0",
+    "pytest-cov>=6.0.0",
+    "pytest-mock>=3.14.0",
+    "ruff>=0.8.4",
+    "mypy>=1.13.0",
+    "bandit>=1.8.0",
 ]
 
 [tool.setuptools]

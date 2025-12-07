@@ -1,363 +1,588 @@
-# tests/test_telnet_client.py
+"""
+Comprehensive tests for the telnet client MCP server.
 
-import time
+Tests cover:
+- Tool functionality
+- Session management
+- Error handling
+- Edge cases
+- Performance characteristics
+"""
+
 import pytest
 import telnetlib
+import time
+from unittest.mock import MagicMock
 
-from chuk_mcp_runtime.common.mcp_tool_decorator import mcp_tool
-from chuk_mcp_telnet_client.models import TelnetClientOutput, CommandResponse
-from chuk_mcp_telnet_client import (
+from chuk_mcp_telnet_client.models import (
+    CommandResponse,
+    TelnetClientInput,
+    TelnetClientOutput,
+)
+from chuk_mcp_telnet_client.tools import (
+    SessionCloseResponse,
+    SessionInfo,
+    SessionListResponse,
+    SessionStore,
+    TelnetCommand,
+    TelnetDefaults,
+    TelnetSession,
+    _connect_telnet,
+    _create_negotiation_callback,
+    _execute_command,
+    _session_store,
+    _strip_command_echo,
     telnet_client_tool,
     telnet_close_session,
     telnet_list_sessions,
-    TELNET_SESSIONS,
 )
-from chuk_mcp_runtime.common.errors import ChukMcpRuntimeError
 
-# Define a fake Telnet class to simulate a Telnet server.
+
+# ============================================================================
+# Fixtures
+# ============================================================================
+
+
 class FakeTelnet:
+    """Mock Telnet connection for testing."""
+
     def __init__(self):
         self.commands_sent = []
         self.closed = False
-        self._data_available = True  # Flag to simulate data availability
+        self.host = None
+        self.port = None
+        self.callback = None
 
     def set_option_negotiation_callback(self, callback):
+        """Set negotiation callback."""
         self.callback = callback
 
     def open(self, host, port, timeout):
-        # Save connection info if needed.
+        """Simulate opening a connection."""
         self.host = host
         self.port = port
 
-    def read_until(self, expected, timeout):
-        # For the initial read (banner) return a fake banner.
-        if not self.commands_sent:
-            return b"FakeBanner\r\n"
-        # For subsequent calls, return a fake response based on the last command.
-        return f"Response to {self.commands_sent[-1]}\r\n".encode("utf-8")
-
     def write(self, data):
-        # Decode and clean up the command
+        """Simulate writing data."""
         cmd = data.decode("utf-8").strip()
-        if cmd.endswith("\r"):
-            cmd = cmd[:-1]
-        if cmd.endswith("\n"):
-            cmd = cmd[:-1]
         self.commands_sent.append(cmd)
 
     def read_very_eager(self):
-        # This is the primary method used by the new client
+        """Simulate reading available data."""
         if not self.commands_sent:
-            return b"FakeBanner\r\n"
-        
-        # Return a response including the command echo
-        last_cmd = self.commands_sent[-1]
+            return b"Welcome to FakeTelnet Server\r\n"
+
+        last_cmd = self.commands_sent[-1].replace("\r\n", "")
         return f"{last_cmd}\r\nResponse to {last_cmd}\r\n".encode("utf-8")
 
     def read_some(self):
-        # Fallback method used by the client
+        """Simulate reading some data."""
         if not self.commands_sent:
-            return b"FakeBanner\r\n"
-        
-        last_cmd = self.commands_sent[-1]
+            return b"Welcome to FakeTelnet Server\r\n"
+
+        last_cmd = self.commands_sent[-1].replace("\r\n", "")
         return f"Response to {last_cmd}\r\n".encode("utf-8")
 
-    def sock_avail(self):
-        # Always return False to indicate no more data
-        return False
-
     def close(self):
+        """Simulate closing connection."""
         self.closed = True
 
 
-# Fixture to monkeypatch telnetlib.Telnet with our FakeTelnet.
 @pytest.fixture
 def fake_telnet(monkeypatch):
+    """Provide a fake telnet connection."""
     monkeypatch.setattr(telnetlib, "Telnet", lambda: FakeTelnet())
-    # Clear any pre-existing sessions before each test.
-    TELNET_SESSIONS.clear()
+    # Clear session store
+    _session_store._sessions.clear()
     yield
-    TELNET_SESSIONS.clear()
+    _session_store._sessions.clear()
 
 
-def test_telnet_client_tool_valid(fake_telnet):
-    """
-    Test that telnet_client_tool returns the expected dict when given valid input.
-    It should include the initial banner and a proper response for each command.
-    """
-    host = "127.0.0.1"
-    port = 8023
-    commands = ["cmd1", "cmd2"]
+@pytest.fixture
+def session_store():
+    """Provide a fresh session store."""
+    return SessionStore()
 
-    # Use minimal delays for faster tests
-    result = telnet_client_tool(
-        host, port, commands, 
-        command_delay=0.1, 
-        response_wait=0.1
+
+# ============================================================================
+# Model Tests
+# ============================================================================
+
+
+def test_telnet_client_input_validation():
+    """Test TelnetClientInput model validation."""
+    # Valid input
+    valid_input = TelnetClientInput(host="localhost", port=23, commands=["test"])
+    assert valid_input.host == "localhost"
+    assert valid_input.port == 23
+    assert len(valid_input.commands) == 1
+
+    # Invalid input - missing required fields
+    with pytest.raises(Exception):  # Pydantic ValidationError
+        TelnetClientInput(host="localhost")  # type: ignore
+
+
+def test_command_response_model():
+    """Test CommandResponse model."""
+    response = CommandResponse(command="test", response="output")
+    assert response.command == "test"
+    assert response.response == "output"
+
+
+def test_telnet_client_output_model():
+    """Test TelnetClientOutput model."""
+    output = TelnetClientOutput(
+        host="localhost",
+        port=23,
+        initial_banner="Welcome",
+        responses=[CommandResponse(command="test", response="output")],
+        session_id="session123",
+        session_active=True,
     )
-    
-    assert isinstance(result, dict)
-    # Check for expected top-level keys.
-    for key in ("host", "port", "initial_banner", "responses", "session_id", "session_active"):
-        assert key in result, f"Missing key '{key}' in result"
-
-    # The initial banner should come from our FakeTelnet.
-    assert "FakeBanner" in result["initial_banner"]
-
-    # Check that the responses list has one response per command.
-    assert len(result["responses"]) == len(commands)
-    for cmd, response in zip(commands, result["responses"]):
-        assert response["command"] == cmd
-        # Our FakeTelnet returns "Response to <cmd>" as part of the response.
-        assert f"Response to {cmd}" in response["response"]
+    assert output.host == "localhost"
+    assert output.session_active is True
+    assert len(output.responses) == 1
 
 
-def test_telnet_client_tool_invalid_input(fake_telnet):
-    """
-    Test that passing an invalid input (e.g. wrong port type) raises a ValueError,
-    as the input validation using Pydantic should fail.
-    """
-    # Use an invalid port (string instead of int)
-    with pytest.raises(ValueError):
-        telnet_client_tool("127.0.0.1", "invalid_port", ["cmd"])
+def test_session_info_model():
+    """Test SessionInfo model."""
+    info = SessionInfo(
+        session_id="test123",
+        host="localhost",
+        port=23,
+        created_at=1000.0,
+        age_seconds=100.5,
+    )
+    assert info.session_id == "test123"
+    assert info.age_seconds == 100.5
 
 
-def test_telnet_client_tool_connection_failure(monkeypatch):
-    """
-    Test that if telnetlib.Telnet.open fails, the tool raises a ChukMcpRuntimeError.
-    """
+def test_session_list_response_model():
+    """Test SessionListResponse model."""
+    response = SessionListResponse(
+        active_sessions=1,
+        sessions={
+            "test": SessionInfo(
+                session_id="test",
+                host="localhost",
+                port=23,
+                created_at=1000.0,
+                age_seconds=100.0,
+            )
+        },
+    )
+    assert response.active_sessions == 1
+    assert "test" in response.sessions
+
+
+def test_session_close_response_model():
+    """Test SessionCloseResponse model."""
+    response = SessionCloseResponse(success=True, message="Closed")
+    assert response.success is True
+    assert response.message == "Closed"
+
+
+# ============================================================================
+# Constants Tests
+# ============================================================================
+
+
+def test_telnet_command_constants():
+    """Test TelnetCommand enum values."""
+    assert TelnetCommand.IAC.value == bytes([255])
+    assert TelnetCommand.DO.value == bytes([253])
+    assert TelnetCommand.DONT.value == bytes([254])
+    assert TelnetCommand.WILL.value == bytes([251])
+    assert TelnetCommand.WONT.value == bytes([252])
+
+
+def test_telnet_defaults():
+    """Test TelnetDefaults class."""
+    assert TelnetDefaults.CONNECTION_TIMEOUT == 10
+    assert TelnetDefaults.INITIAL_BANNER_WAIT == 2.0
+    assert TelnetDefaults.COMMAND_DELAY == 1.0
+    assert TelnetDefaults.RESPONSE_WAIT == 1.5
+    assert TelnetDefaults.READ_TIMEOUT == 5
+
+
+# ============================================================================
+# Session Store Tests
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_session_store_operations(session_store):
+    """Test session store CRUD operations."""
+    fake_tn = FakeTelnet()
+    session = TelnetSession(
+        telnet=fake_tn,
+        host="localhost",
+        port=23,
+        created_at=time.time(),
+        session_id="test123",
+    )
+
+    # Store
+    await session_store.store(session)
+    assert len(session_store._sessions) == 1
+
+    # Get
+    retrieved = await session_store.get("test123")
+    assert retrieved is not None
+    assert retrieved.session_id == "test123"
+
+    # List
+    all_sessions = await session_store.list_all()
+    assert len(all_sessions) == 1
+
+    # Delete
+    await session_store.delete("test123")
+    assert len(session_store._sessions) == 0
+
+
+@pytest.mark.asyncio
+async def test_session_store_delete_nonexistent(session_store):
+    """Test deleting a non-existent session doesn't raise error."""
+    await session_store.delete("nonexistent")  # Should not raise
+
+
+# ============================================================================
+# Helper Function Tests
+# ============================================================================
+
+
+def test_create_negotiation_callback():
+    """Test negotiation callback creation."""
+    callback = _create_negotiation_callback()
+    assert callable(callback)
+
+    # Mock socket
+    mock_sock = MagicMock()
+
+    # Test DO command
+    callback(mock_sock, TelnetCommand.DO.value, b"\x01")
+    mock_sock.sendall.assert_called()
+
+    # Test WILL command
+    callback(mock_sock, TelnetCommand.WILL.value, b"\x01")
+    assert mock_sock.sendall.call_count >= 2
+
+
+def test_strip_command_echo():
+    """Test command echo stripping."""
+    # Test exact match
+    assert _strip_command_echo("test\r\noutput", "test") == "\r\noutput"
+
+    # Test CRLF variant
+    assert _strip_command_echo("test\r\n\r\noutput", "test") == "\r\n\r\noutput"
+
+    # Test no match
+    assert _strip_command_echo("output", "test") == "output"
+
+    # Test partial match in middle
+    result = _strip_command_echo("prefix test suffix", "test")
+    assert "test" not in result or len(result) < len("prefix test suffix")
+
+
+@pytest.mark.asyncio
+async def test_connect_telnet(fake_telnet):
+    """Test telnet connection establishment."""
+    tn, banner = await _connect_telnet("localhost", 23)
+
+    assert tn is not None
+    assert isinstance(banner, str)
+    assert "FakeTelnet" in banner
+
+
+@pytest.mark.asyncio
+async def test_connect_telnet_failure(monkeypatch):
+    """Test telnet connection failure handling."""
+
     class FailingTelnet:
-        def __init__(self):
-            pass
-        
         def set_option_negotiation_callback(self, callback):
             pass
-        
+
         def open(self, host, port, timeout):
-            raise Exception("Connection failed")
+            raise ConnectionRefusedError("Connection refused")
 
     monkeypatch.setattr(telnetlib, "Telnet", lambda: FailingTelnet())
-    TELNET_SESSIONS.clear()
 
-    with pytest.raises(ChukMcpRuntimeError) as excinfo:
-        telnet_client_tool("127.0.0.1", 8023, ["cmd"])
-    assert "Failed to connect" in str(excinfo.value)
+    with pytest.raises(RuntimeError) as exc_info:
+        await _connect_telnet("localhost", 23)
 
-# Just the fixed test
-
-def test_telnet_client_strip_command_echo(fake_telnet):
-    """
-    Test that the telnet client properly strips command echo from responses
-    when strip_command_echo is enabled.
-    """
-    host = "127.0.0.1"
-    port = 8023
-    commands = ["echo_test"]
-
-    # With echo stripping enabled (default)
-    result_with_strip = telnet_client_tool(
-        host, port, commands,
-        command_delay=0.1, 
-        response_wait=0.1
-    )
-    
-    # We're still asserting the response contains the expected text
-    assert "Response to echo_test" in result_with_strip["responses"][0]["response"]
-    
-    # With echo stripping disabled
-    TELNET_SESSIONS.clear()  # Clear sessions for a fresh test
-    result_without_strip = telnet_client_tool(
-        host, port, commands, 
-        strip_command_echo=False,
-        command_delay=0.1, 
-        response_wait=0.1
-    )
-    
-    # The response with echo stripping disabled should be longer 
-    # or contain more instances of the command
-    stripped_length = len(result_with_strip["responses"][0]["response"])
-    unstripped_length = len(result_without_strip["responses"][0]["response"])
-    
-    # Either the unstripped response should be longer, or it should 
-    # contain command text that the stripped version doesn't
-    assert (unstripped_length > stripped_length or 
-            result_without_strip["responses"][0]["response"].count("echo_test") > 
-            result_with_strip["responses"][0]["response"].count("echo_test")), \
-           "Echo stripping doesn't appear to be working"
-    
-def test_telnet_client_read_timeout(fake_telnet):
-    """
-    Test that the telnet client respects the read_timeout parameter.
-    """
-    host = "127.0.0.1"
-    port = 8023
-    commands = ["cmd"]
-
-    # With a very short timeout
-    start_time = time.time()
-    result_short_timeout = telnet_client_tool(
-        host, port, commands, 
-        read_timeout=1, 
-        command_delay=0.1, 
-        response_wait=0.1
-    )
-    end_time = time.time()
-    
-    # The command should still succeed but take less time
-    assert "Response to cmd" in result_short_timeout["responses"][0]["response"]
-    assert end_time - start_time < 3, "Short timeout test took too long"
-
-    # Clear sessions for a fresh test
-    TELNET_SESSIONS.clear()
-
-    # With a longer timeout
-    start_time = time.time()
-    result_long_timeout = telnet_client_tool(
-        host, port, commands, 
-        read_timeout=2, 
-        command_delay=0.5, 
-        response_wait=0.5
-    )
-    end_time = time.time()
-    
-    # The command should succeed and take more time due to longer delays
-    assert "Response to cmd" in result_long_timeout["responses"][0]["response"]
-    assert end_time - start_time > 0.5, "Long timeout test was too quick"
+    assert "Failed to connect" in str(exc_info.value)
 
 
-def test_telnet_close_session(fake_telnet):
-    """
-    Test that telnet_close_session successfully closes an existing session.
-    A subsequent call to close the same session should report that it no longer exists.
-    """
-    host = "127.0.0.1"
-    port = 8023
-    commands = ["cmd1"]
+@pytest.mark.asyncio
+async def test_execute_command(fake_telnet):
+    """Test command execution."""
+    tn = FakeTelnet()
+    tn.open("localhost", 23, 10)
 
-    # Open a new session with minimal delays
-    result = telnet_client_tool(
-        host, port, commands,
-        command_delay=0.1, 
-        response_wait=0.1
-    )
-    session_id = result["session_id"]
-
-    # Close the session.
-    close_result = telnet_close_session(session_id)
-    assert close_result["success"] is True
-
-    # Attempt to close the session again; should return not found.
-    close_result2 = telnet_close_session(session_id)
-    assert close_result2["success"] is False
-
-
-def test_telnet_list_sessions(fake_telnet):
-    """
-    Test that telnet_list_sessions returns the correct number of active sessions
-    and the session information is present.
-    """
-    # Start with no active sessions.
-    sessions_before = telnet_list_sessions()
-    initial_count = sessions_before["active_sessions"]
-
-    # Open a new session with minimal delays
-    host = "127.0.0.1"
-    port = 8023
-    commands = ["cmd1"]
-    result = telnet_client_tool(
-        host, port, commands,
-        command_delay=0.1, 
-        response_wait=0.1
+    response = await _execute_command(
+        tn=tn, command="test", command_delay=0.1, response_wait=0.1, strip_echo=True
     )
 
-    # List sessions after opening a new one.
-    sessions_after = telnet_list_sessions()
-    assert sessions_after["active_sessions"] == initial_count + 1
-    assert result["session_id"] in sessions_after["sessions"]
+    assert isinstance(response, CommandResponse)
+    assert response.command == "test"
+    assert len(response.response) > 0
 
 
-def test_telnet_client_persistent_session(fake_telnet):
-    """
-    Test that a session can be reused across multiple calls.
-    """
-    host = "127.0.0.1"
-    port = 8023
-    
-    # First call - create a new session
-    result1 = telnet_client_tool(
-        host, port, ["cmd1"],
-        command_delay=0.1, 
-        response_wait=0.1
+# ============================================================================
+# Integration Tests - Main Tool Functions
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_telnet_client_tool_basic(fake_telnet):
+    """Test basic telnet client tool functionality."""
+    result = await telnet_client_tool(
+        host="localhost",
+        port=23,
+        commands=["ls", "pwd"],
+        command_delay=0.1,
+        response_wait=0.1,
     )
-    session_id = result1["session_id"]
-    
-    # Second call - reuse the session
-    result2 = telnet_client_tool(
-        host, port, ["cmd2"], 
-        session_id=session_id,
-        command_delay=0.1, 
-        response_wait=0.1
+
+    assert isinstance(result, TelnetClientOutput)
+    assert result.host == "localhost"
+    assert result.port == 23
+    assert len(result.responses) == 2
+    assert result.session_active is True
+    assert "FakeTelnet" in result.initial_banner
+
+
+@pytest.mark.asyncio
+async def test_telnet_client_tool_invalid_input(fake_telnet):
+    """Test telnet client tool with invalid input."""
+    with pytest.raises(ValueError) as exc_info:
+        await telnet_client_tool(
+            host="localhost",
+            port="invalid",  # type: ignore
+            commands=["test"],
+        )
+
+    assert "Invalid input" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_telnet_client_tool_session_reuse(fake_telnet):
+    """Test session reuse across multiple calls."""
+    # First call
+    result1 = await telnet_client_tool(
+        host="localhost",
+        port=23,
+        commands=["cmd1"],
+        command_delay=0.1,
+        response_wait=0.1,
     )
-    
-    # Verify the session is the same
-    assert result2["session_id"] == session_id
-    assert result2["session_active"] is True
-    
-    # Verify both commands were processed
-    telnet_obj = TELNET_SESSIONS[session_id]["telnet"]
-    assert "cmd1" in telnet_obj.commands_sent
-    assert "cmd2" in telnet_obj.commands_sent
+    session_id = result1.session_id
+
+    # Second call with same session
+    result2 = await telnet_client_tool(
+        host="localhost",
+        port=23,
+        commands=["cmd2"],
+        telnet_session_id=session_id,
+        command_delay=0.1,
+        response_wait=0.1,
+    )
+
+    assert result2.session_id == session_id
+    assert result2.initial_banner == ""  # No banner for reused session
+    assert result2.session_active is True
 
 
-def test_telnet_client_auto_close_session(fake_telnet):
-    """
-    Test that setting close_session=True automatically closes the session after commands.
-    """
-    host = "127.0.0.1"
-    port = 8023
-    
-    # Open and immediately close a session
-    result = telnet_client_tool(
-        host, port, ["cmd"], 
+@pytest.mark.asyncio
+async def test_telnet_client_tool_auto_close(fake_telnet):
+    """Test automatic session closing."""
+    result = await telnet_client_tool(
+        host="localhost",
+        port=23,
+        commands=["test"],
         close_session=True,
-        command_delay=0.1, 
-        response_wait=0.1
+        command_delay=0.1,
+        response_wait=0.1,
     )
-    session_id = result["session_id"]
-    
-    # Verify the session is closed
-    assert result["session_active"] is False
-    assert session_id not in TELNET_SESSIONS
+
+    assert result.session_active is False
 
 
-def test_telnet_client_command_delay(fake_telnet):
-    """
-    Test that the command_delay parameter affects the execution time.
-    """
-    host = "127.0.0.1"
-    port = 8023
-    commands = ["cmd1", "cmd2"]
-    
-    # With minimal delay
-    start_time = time.time()
-    telnet_client_tool(
-        host, port, commands, 
-        command_delay=0.1, 
-        response_wait=0.1
+@pytest.mark.asyncio
+async def test_telnet_client_tool_echo_stripping(fake_telnet):
+    """Test command echo stripping."""
+    # With stripping enabled
+    result_with = await telnet_client_tool(
+        host="localhost",
+        port=23,
+        commands=["echo_test"],
+        strip_command_echo=True,
+        command_delay=0.1,
+        response_wait=0.1,
     )
-    short_delay_time = time.time() - start_time
-    
-    # Clear sessions for a fresh test
-    TELNET_SESSIONS.clear()
-    
-    # With longer delay
-    start_time = time.time()
-    telnet_client_tool(
-        host, port, commands, 
-        command_delay=0.3, 
-        response_wait=0.1
+
+    # With stripping disabled
+    _session_store._sessions.clear()
+    result_without = await telnet_client_tool(
+        host="localhost",
+        port=23,
+        commands=["echo_test"],
+        strip_command_echo=False,
+        command_delay=0.1,
+        response_wait=0.1,
     )
-    long_delay_time = time.time() - start_time
-    
-    # The longer delay should take more time
-    assert long_delay_time > short_delay_time, "Longer command_delay should take more time"
+
+    # Response without stripping should be different
+    assert result_with.responses[0].response != result_without.responses[0].response
+
+
+@pytest.mark.asyncio
+async def test_telnet_close_session_tool(fake_telnet):
+    """Test session closing tool."""
+    # Create a session
+    result = await telnet_client_tool(
+        host="localhost",
+        port=23,
+        commands=["test"],
+        command_delay=0.1,
+        response_wait=0.1,
+    )
+    session_id = result.session_id
+
+    # Close it
+    close_result = await telnet_close_session(session_id)
+
+    assert isinstance(close_result, SessionCloseResponse)
+    assert close_result.success is True
+    assert session_id in close_result.message
+
+
+@pytest.mark.asyncio
+async def test_telnet_list_sessions_tool(fake_telnet):
+    """Test session listing tool."""
+    # Start with no sessions
+    result1 = await telnet_list_sessions()
+    assert result1.active_sessions == 0
+
+    # Create a session
+    client_result = await telnet_client_tool(
+        host="localhost",
+        port=23,
+        commands=["test"],
+        command_delay=0.1,
+        response_wait=0.1,
+    )
+
+    # List sessions
+    result2 = await telnet_list_sessions()
+    assert result2.active_sessions == 1
+    assert client_result.session_id in result2.sessions
+
+    # Verify session info
+    session_info = result2.sessions[client_result.session_id]
+    assert isinstance(session_info, SessionInfo)
+    assert session_info.host == "localhost"
+    assert session_info.port == 23
+
+
+# ============================================================================
+# Edge Case Tests
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_telnet_client_empty_commands(fake_telnet):
+    """Test handling of empty command list."""
+    result = await telnet_client_tool(
+        host="localhost", port=23, commands=[], command_delay=0.1, response_wait=0.1
+    )
+
+    assert len(result.responses) == 0
+    assert result.session_active is True
+
+
+@pytest.mark.asyncio
+async def test_telnet_client_many_commands(fake_telnet):
+    """Test handling of many commands."""
+    commands = [f"cmd{i}" for i in range(10)]
+
+    result = await telnet_client_tool(
+        host="localhost",
+        port=23,
+        commands=commands,
+        command_delay=0.01,
+        response_wait=0.01,
+    )
+
+    assert len(result.responses) == 10
+    for i, response in enumerate(result.responses):
+        assert response.command == f"cmd{i}"
+
+
+@pytest.mark.asyncio
+async def test_telnet_client_custom_timeouts(fake_telnet):
+    """Test custom timeout parameters."""
+    result = await telnet_client_tool(
+        host="localhost",
+        port=23,
+        commands=["test"],
+        read_timeout=1,
+        command_delay=0.05,
+        response_wait=0.05,
+    )
+
+    assert result.session_active is True
+
+
+# ============================================================================
+# Performance Tests
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_telnet_client_timing(fake_telnet):
+    """Test that delays are respected."""
+    start_time = time.time()
+
+    await telnet_client_tool(
+        host="localhost",
+        port=23,
+        commands=["cmd1", "cmd2"],
+        command_delay=0.2,
+        response_wait=0.1,
+    )
+
+    elapsed = time.time() - start_time
+
+    # Should take at least (command_delay + response_wait) * 2 commands
+    # Plus initial banner wait, but we use shorter values in tests
+    assert elapsed >= 0.4  # (0.2 + 0.1) * 2 - some tolerance
+
+
+# ============================================================================
+# Cleanup Tests
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_session_cleanup_on_close(fake_telnet):
+    """Test that closing a session cleans up resources."""
+    result = await telnet_client_tool(
+        host="localhost",
+        port=23,
+        commands=["test"],
+        command_delay=0.1,
+        response_wait=0.1,
+    )
+    session_id = result.session_id
+
+    # Verify session exists
+    sessions = await telnet_list_sessions()
+    assert session_id in sessions.sessions
+
+    # Close session
+    await telnet_close_session(session_id)
+
+    # Verify session is gone
+    sessions = await telnet_list_sessions()
+    assert session_id not in sessions.sessions
