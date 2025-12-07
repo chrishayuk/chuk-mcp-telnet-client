@@ -137,6 +137,7 @@ Establishes a connection to a Telnet server and executes commands.
 - `command_delay`: Delay in seconds after sending each command (default: 1.0)
 - `response_wait`: Time to wait for response in seconds (default: 1.5)
 - `strip_command_echo`: Remove command echo from responses (default: True)
+- `raw_input` (optional): Send input as raw bytes without CRLF line endings (default: False)
 
 **Example**:
 ```python
@@ -184,6 +185,42 @@ telnet_list_sessions()
 **Returns**:
 - Count of active sessions
 - Details for each session (host, port, creation time, age)
+
+## Limitations and Known Issues
+
+### Interactive Full-Screen Applications
+
+The telnet client is optimized for **line-based command-response protocols** (like command shells, routers, switches). It has **limited support** for full-screen interactive applications that use cursor positioning (like text editors, games, or menu systems).
+
+**Why?**
+- Full-screen apps rely on ANSI escape sequences for cursor control and screen updates
+- They expect raw keystrokes (arrow keys, single characters) without line feeds
+- Responses are visual state updates rather than text output
+- The `telnetlib` library is designed for line-based protocols
+
+**Workarounds:**
+1. Use the `raw_input=True` parameter to send keystrokes without CRLF:
+   ```python
+   # Quit a full-screen game
+   telnet_client_tool(
+       host="telehack.com",
+       port=23,
+       commands=["q"],  # Single keystroke
+       raw_input=True,  # Don't add CRLF
+       telnet_session_id=session_id
+   )
+   ```
+
+2. For complex interactions, consider:
+   - Using the application's command-line interface (if available)
+   - Accessing via HTTP API instead of telnet
+   - Using a proper terminal emulator library (like `pexpect` or `fabric`)
+
+**Examples of affected applications:**
+- Interactive games (sudoku, adventure games)
+- Text editors (vim, emacs, nano)
+- Menu-based systems (BBS menus)
+- Applications expecting arrow key navigation
 
 ## Technical Details
 

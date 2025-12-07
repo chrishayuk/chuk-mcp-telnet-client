@@ -116,7 +116,7 @@ class SessionStore:
         session = self._sessions.get(session_id)
         if session:
             try:
-                session.telnet.close()
+                await asyncio.to_thread(session.telnet.close)
             except Exception as e:
                 logger.warning(f"Error closing telnet connection: {e}")
             del self._sessions[session_id]
@@ -166,17 +166,20 @@ async def _connect_telnet(host: str, port: int) -> tuple[telnetlib.Telnet, str]:
     tn.set_option_negotiation_callback(_create_negotiation_callback())
 
     try:
-        tn.open(host, port, timeout=TelnetDefaults.CONNECTION_TIMEOUT)
+        # Run blocking open() in thread pool
+        await asyncio.to_thread(tn.open, host, port, TelnetDefaults.CONNECTION_TIMEOUT)
     except Exception as ex:
         raise RuntimeError(f"Failed to connect to Telnet server at {host}:{port}: {ex}")
 
     # Read initial banner
     await asyncio.sleep(TelnetDefaults.INITIAL_BANNER_WAIT)
-    initial_data = tn.read_very_eager()
+
+    # Run blocking read operations in thread pool
+    initial_data = await asyncio.to_thread(tn.read_very_eager)
 
     # Try to read some data if nothing received
     if not initial_data:
-        initial_data = tn.read_some()
+        initial_data = await asyncio.to_thread(tn.read_some)
 
     initial_banner = initial_data.decode("utf-8", errors="ignore")
     return tn, initial_banner
@@ -222,6 +225,7 @@ async def _execute_command(
     command_delay: float,
     response_wait: float,
     strip_echo: bool,
+    raw_input: bool = False,
 ) -> CommandResponse:
     """
     Execute a single command on the telnet connection.
@@ -232,13 +236,17 @@ async def _execute_command(
         command_delay: Delay after sending command
         response_wait: Time to wait for complete response
         strip_echo: Whether to strip command echo
+        raw_input: If True, send command as-is without adding CRLF (for interactive apps)
 
     Returns:
         CommandResponse with command and its response
     """
-    # Send command with CRLF
-    cmd_bytes = command.encode("utf-8") + b"\r\n"
-    tn.write(cmd_bytes)
+    # Send command with or without CRLF depending on mode
+    if raw_input:
+        cmd_bytes = command.encode("utf-8")
+    else:
+        cmd_bytes = command.encode("utf-8") + b"\r\n"
+    await asyncio.to_thread(tn.write, cmd_bytes)
 
     # Give server time to process
     await asyncio.sleep(command_delay)
@@ -247,7 +255,7 @@ async def _execute_command(
     data = b""
 
     # Read immediately available data
-    initial_chunk = tn.read_very_eager()
+    initial_chunk = await asyncio.to_thread(tn.read_very_eager)
     if initial_chunk:
         data += initial_chunk
 
@@ -255,13 +263,21 @@ async def _execute_command(
     await asyncio.sleep(response_wait)
 
     # Read remaining data
-    more_data = tn.read_very_eager()
+    more_data = await asyncio.to_thread(tn.read_very_eager)
     if more_data:
         data += more_data
 
-    # If no data, try one more approach
+    # If no data yet, try a timed read with timeout
+    # Use read_until with a short timeout instead of blocking read_some
     if not data:
-        data = tn.read_some()
+        try:
+            # Try to read with a 1 second timeout instead of blocking indefinitely
+            data = await asyncio.wait_for(
+                asyncio.to_thread(tn.read_very_eager), timeout=1.0
+            )
+        except asyncio.TimeoutError:
+            # No data available, that's okay for interactive sessions
+            pass
 
     # Decode response
     response_text = data.decode("utf-8", errors="ignore")
@@ -280,7 +296,7 @@ async def _execute_command(
 
 @tool(
     name="telnet_client",
-    description="Connect to a Telnet server, run commands, and return output.",
+    description="Connect to a Telnet server, run commands, and return output. Best for line-based command shells. For interactive full-screen apps (games, editors), use raw_input=True and send single-key commands (e.g., 'q' to quit, not 'quit').",
 )
 async def telnet_client_tool(
     host: str,
@@ -292,6 +308,7 @@ async def telnet_client_tool(
     command_delay: float = TelnetDefaults.COMMAND_DELAY,
     response_wait: float = TelnetDefaults.RESPONSE_WAIT,
     strip_command_echo: bool = True,
+    raw_input: bool = False,
 ) -> TelnetClientOutput:
     """
     Universal Telnet client tool that works with various server types.
@@ -299,16 +316,33 @@ async def telnet_client_tool(
     Supports session persistence when running via HTTP/SSE transport, allowing
     you to maintain an open telnet connection across multiple tool calls.
 
+    IMPORTANT - Interactive Applications:
+    - Line-based shells (default): Send commands like ['ls', 'pwd'] with raw_input=False
+    - Full-screen interactive apps (games, vim, sudoku):
+      * To just VIEW the state: Send ['sudoku'] with close_session=True (force-close after)
+      * To interact: Must use TWO separate calls:
+        1. Start: telnet_client(['sudoku'], close_session=False) -> get session_id
+        2. Quit: telnet_client(['q'], session_id=..., raw_input=True, close_session=True)
+      * Single-key commands only with raw_input=True: 'q' to quit (not 'quit')
+      * These apps use cursor positioning and expect raw keystrokes
+    - Programmatic interaction with interactive apps is VERY LIMITED
+      * You can start them, view initial state, and quit them
+      * You CANNOT easily solve puzzles or edit files through this interface
+      * RECOMMENDED: Parse initial state, then solve locally with solver tools
+      * Do NOT try to send move-by-move commands to interactive games
+
     Args:
         host: Host or IP to connect to
         port: Port number
-        commands: List of commands to send
+        commands: List of commands to send (use single chars like 'q' for interactive apps)
         telnet_session_id: Telnet session ID for reusing existing connections (HTTP/SSE only)
         close_session: Whether to close the telnet session after commands
         read_timeout: Timeout in seconds when waiting for initial responses
-        command_delay: Delay after sending each command
-        response_wait: Additional time to wait for complete response
-        strip_command_echo: Try to remove command echo from responses
+        command_delay: Delay after sending each command (default: 1.0s)
+        response_wait: Additional time to wait for complete response (default: 1.5s)
+        strip_command_echo: Try to remove command echo from responses (default: True)
+        raw_input: Send input as raw bytes without CRLF line endings (use True for
+                  interactive games/editors that expect single keystrokes)
 
     Returns:
         TelnetClientOutput with server responses and session information
@@ -334,7 +368,23 @@ async def telnet_client_tool(
         # Reuse existing connection
         tn = existing_session.telnet
         initial_banner = ""  # No banner for existing sessions
-    else:
+
+        # Verify the connection is still alive
+        try:
+            # Quick check - try to read any pending data with very short timeout
+            await asyncio.wait_for(asyncio.to_thread(tn.read_very_eager), timeout=0.1)
+        except asyncio.TimeoutError:
+            # No data available - connection is idle, which is fine
+            pass
+        except (OSError, EOFError):
+            # Connection is dead - remove it and create a new one
+            logger.warning(
+                f"Session {telnet_session_id} connection is dead, creating new connection"
+            )
+            await _session_store.delete(telnet_session_id)
+            existing_session = None  # Fall through to create new connection
+
+    if not existing_session:
         # Create new connection
         tn, initial_banner = await _connect_telnet(
             validated_input.host, validated_input.port
@@ -353,14 +403,29 @@ async def telnet_client_tool(
     # Execute commands
     responses: list[CommandResponse] = []
     for cmd in validated_input.commands:
-        response = await _execute_command(
-            tn=tn,
-            command=cmd,
-            command_delay=command_delay,
-            response_wait=response_wait,
-            strip_echo=strip_command_echo,
-        )
-        responses.append(response)
+        try:
+            response = await _execute_command(
+                tn=tn,
+                command=cmd,
+                command_delay=command_delay,
+                response_wait=response_wait,
+                strip_echo=strip_command_echo,
+                raw_input=raw_input,
+            )
+            responses.append(response)
+        except (OSError, EOFError) as e:
+            # Connection was closed (likely by exit/quit command or server disconnect)
+            # This is expected behavior, not an error - just stop processing commands
+            logger.info(f"Connection closed while executing '{cmd}': {e}")
+            # Add a response indicating connection was closed
+            responses.append(
+                CommandResponse(command=cmd, response="(connection closed by server)")
+            )
+            break  # Stop processing remaining commands
+        except Exception as e:
+            # Unexpected error - log and re-raise with context
+            logger.error(f"Failed to execute command '{cmd}': {e}")
+            raise RuntimeError(f"Failed to execute command '{cmd}': {e}") from e
 
     # Close connection if requested
     if close_session:

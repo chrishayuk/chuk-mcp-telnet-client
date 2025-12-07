@@ -50,16 +50,16 @@ wheels = [
 
 [[package]]
 name = "chuk-mcp"
-version = "0.9"
+version = "0.9.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
     { name = "httpx" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/d4/0f/b7f958e95d4c4313b6fcbdd7a7bd0212f61d32345b302c522d2a20fc6482/chuk_mcp-0.9.tar.gz", hash = "sha256:1544f85aa35d60c8f6a5017ec8f1ef659be238da4d1f21fcb4495ba87c91df31", size = 156868, upload-time = "2025-11-19T00:52:44.941Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/a4/e9/68d7b5f3f99461580e0ef3c862b37c351be98e60e968fda5cf85939e2845/chuk_mcp-0.9.1.tar.gz", hash = "sha256:f318e4f06047784553c97763ede2172d82b12b74c18d20ca7a0cffea0b67d4f8", size = 158404, upload-time = "2025-12-07T10:34:09.162Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/1b/ca/7d3381df501c6636a0eaa1f1ae3ff82b3a0f80ef830b8b0a7b3915617bc6/chuk_mcp-0.9-py3-none-any.whl", hash = "sha256:ea821711741db3802e25ad8c183d9933a267ca40a9ef176a2236e17a4ea06666", size = 140648, upload-time = "2025-11-19T00:52:43.527Z" },
+    { url = "https://files.pythonhosted.org/packages/65/0b/633f6ab1962f8a11888ad4e6d7e5474ec75d61c8645c5a01db9ee8a5c156/chuk_mcp-0.9.1-py3-none-any.whl", hash = "sha256:aeac7dd9842467d7d99136c3ce99fe69013aa5d73e707456c30ca1fe9676cd8b", size = 141052, upload-time = "2025-12-07T10:34:07.517Z" },
 ]
 
 [[package]]
